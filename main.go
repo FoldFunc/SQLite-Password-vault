@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
@@ -256,6 +257,70 @@ func makeVaultEntryHandler(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Vault entry added"})
 }
 
+type getVaultInfo struct {
+	Title string `json:"title"`
+}
+
+func getVaultEntryHandler(c *fiber.Ctx) error {
+	log.Println("getVaultEntryHandler called")
+
+	// Get the token from the cookie
+	tokenString := c.Cookies("token")
+	if tokenString == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Missing token"})
+	}
+
+	// Parse the token
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return JWTSECRET, nil
+	})
+	if err != nil || !token.Valid {
+		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
+	}
+
+	// Extract claims
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token claims"})
+	}
+
+	login := claims["email"].(string)
+
+	// Find user
+	var user Users
+	if err := DB.Where("login = ?", login).First(&user).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(map[string]string{"error": "User not found"})
+	}
+
+	// Parse body
+	var cred getVaultInfo
+	if err := c.BodyParser(&cred); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": "Invalid body"})
+	}
+
+	// Find the vault entry
+	var entry vaultInfo
+	if err := DB.Where("user_email = ? AND title = ?", login, cred.Title).First(&entry).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(map[string]string{"error": "Vault entry not found"})
+	}
+
+	// Decrypt secret
+	salt, _ := base64.StdEncoding.DecodeString(user.EncryptionSalt)
+	key, _ := deriveKey(user.Password, salt)
+	decryptedSecret, err := decrypt(entry.Secret, key)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": "Could not decrypt secret"})
+	}
+
+	return c.JSON(fiber.Map{
+		"title":  entry.Title,
+		"secret": decryptedSecret,
+	})
+}
+
 // --- Main ---
 
 func main() {
@@ -263,10 +328,11 @@ func main() {
 	Init()
 
 	app := fiber.New()
-
+	app.Use(limiter.New())
 	app.Post("/register", registerHandler)
 	app.Post("/login", loginHandler)
 	app.Post("/makeVaultEntry", makeVaultEntryHandler)
+	app.Post("/getVaultEntry", getVaultEntryHandler)
 
 	log.Fatal(app.Listen(":8080"))
 }
