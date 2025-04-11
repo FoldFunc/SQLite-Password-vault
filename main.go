@@ -30,6 +30,12 @@ type Users struct {
 	Password       string `gorm:"not null"`
 	EncryptionSalt string `gorm:"not null"`
 }
+type vaultInfo struct {
+	ID        uint   `gorm:"primaryKey"`
+	UserEmail string `gorm:" not null"`
+	Title     string `json:"title"`
+	Secret    string `json:"secret"`
+}
 
 // Load environment variables
 func InitEnv() {
@@ -51,6 +57,9 @@ func Init() {
 		log.Fatal("Failed to connect to the database: ", err)
 	}
 	if err := DB.AutoMigrate(&Users{}); err != nil {
+		log.Fatal("AutoMigrate error: ", err)
+	}
+	if err := DB.AutoMigrate(&vaultInfo{}); err != nil {
 		log.Fatal("AutoMigrate error: ", err)
 	}
 }
@@ -176,7 +185,7 @@ func loginHandler(c *fiber.Ctx) error {
 
 	// Create JWT
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"login": cred.Login,
+		"email": cred.Login,
 		"exp":   time.Now().Add(time.Hour * 24).Unix(),
 	})
 
@@ -184,8 +193,67 @@ func loginHandler(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Could not sign token"})
 	}
+	c.Cookie(&fiber.Cookie{
+		Name:     "token",
+		Value:    tokenString,
+		HTTPOnly: true,
+		Secure:   false,
+		SameSite: "Lax",
+	})
 
 	return c.JSON(fiber.Map{"token": tokenString})
+}
+
+func makeVaultEntryHandler(c *fiber.Ctx) error {
+	log.Println("makeVaultEntryHandler called")
+
+	tokenString := c.Cookies("token")
+	if tokenString == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Missing token"})
+	}
+
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return JWTSECRET, nil
+	})
+	if err != nil || !token.Valid {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid token"})
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	login := claims["email"].(string)
+
+	var user Users
+	if err := DB.Where("login = ?", login).First(&user).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	var input vaultInfo
+	if err := c.BodyParser(&input); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid body"})
+	}
+
+	salt, _ := base64.StdEncoding.DecodeString(user.EncryptionSalt)
+	key, _ := deriveKey(user.Password, salt)
+
+	encryptedSecret, err := encrypt(input.Secret, key)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Encryption failed"})
+	}
+
+	entry := vaultInfo{
+		UserEmail: login,
+		Title:     input.Title,
+		Secret:    encryptedSecret,
+	}
+
+	if err := DB.Create(&entry).Error; err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Could not save entry"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Vault entry added"})
 }
 
 // --- Main ---
@@ -198,6 +266,7 @@ func main() {
 
 	app.Post("/register", registerHandler)
 	app.Post("/login", loginHandler)
+	app.Post("/makeVaultEntry", makeVaultEntryHandler)
 
 	log.Fatal(app.Listen(":8080"))
 }
