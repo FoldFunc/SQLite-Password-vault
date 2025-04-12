@@ -6,12 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"log"
-	"os"
-	"time"
-
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
@@ -19,6 +15,10 @@ import (
 	"golang.org/x/crypto/scrypt"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"io"
+	"log"
+	"os"
+	"time"
 )
 
 var DB *gorm.DB
@@ -31,6 +31,7 @@ type Users struct {
 	Password       string `gorm:"not null"`
 	EncryptionSalt string `gorm:"not null"`
 }
+
 type vaultInfo struct {
 	ID        uint   `gorm:"primaryKey"`
 	UserEmail string `gorm:" not null"`
@@ -57,10 +58,7 @@ func Init() {
 	if err != nil {
 		log.Fatal("Failed to connect to the database: ", err)
 	}
-	if err := DB.AutoMigrate(&Users{}); err != nil {
-		log.Fatal("AutoMigrate error: ", err)
-	}
-	if err := DB.AutoMigrate(&vaultInfo{}); err != nil {
+	if err := DB.AutoMigrate(&Users{}, &vaultInfo{}); err != nil {
 		log.Fatal("AutoMigrate error: ", err)
 	}
 }
@@ -170,6 +168,7 @@ type loginCredentials struct {
 }
 
 func loginHandler(c *fiber.Ctx) error {
+	log.Println("loginHandler called")
 	var cred loginCredentials
 	if err := c.BodyParser(&cred); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
@@ -205,9 +204,7 @@ func loginHandler(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"token": tokenString})
 }
 
-func makeVaultEntryHandler(c *fiber.Ctx) error {
-	log.Println("makeVaultEntryHandler called")
-
+func jwtMiddleware(c *fiber.Ctx) error {
 	tokenString := c.Cookies("token")
 	if tokenString == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Missing token"})
@@ -224,18 +221,55 @@ func makeVaultEntryHandler(c *fiber.Ctx) error {
 	}
 
 	claims := token.Claims.(jwt.MapClaims)
-	login := claims["email"].(string)
+	c.Locals("user", claims["email"])
+	return c.Next()
+}
 
+func makeVaultEntryHandler(c *fiber.Ctx) error {
+	log.Println("makeVaultEntryHandler called")
+
+	// Get the token from the cookie
+	tokenString := c.Cookies("token")
+	if tokenString == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Missing token"})
+	}
+
+	// Parse the token
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method")
+		}
+		return JWTSECRET, nil
+	})
+	if err != nil || !token.Valid {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid token"})
+	}
+
+	// Extract claims
+	claims := token.Claims.(jwt.MapClaims)
+	login, ok := claims["email"].(string)
+	if !ok || login == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid token: email missing"})
+	}
+
+	// Find user
 	var user Users
 	if err := DB.Where("login = ?", login).First(&user).Error; err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
 	}
 
+	// Parse body
 	var input vaultInfo
 	if err := c.BodyParser(&input); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid body"})
 	}
 
+	// Ensure Title and Secret are provided
+	if input.Title == "" || input.Secret == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing title or secret"})
+	}
+
+	// Encrypt the secret before saving it
 	salt, _ := base64.StdEncoding.DecodeString(user.EncryptionSalt)
 	key, _ := deriveKey(user.Password, salt)
 
@@ -257,17 +291,11 @@ func makeVaultEntryHandler(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Vault entry added"})
 }
 
-type getVaultInfo struct {
-	Title string `json:"title"`
-}
-
 func getVaultEntryHandler(c *fiber.Ctx) error {
-	log.Println("getVaultEntryHandler called")
-
 	// Get the token from the cookie
 	tokenString := c.Cookies("token")
 	if tokenString == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Missing token"})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Missing token"})
 	}
 
 	// Parse the token
@@ -278,56 +306,61 @@ func getVaultEntryHandler(c *fiber.Ctx) error {
 		return JWTSECRET, nil
 	})
 	if err != nil || !token.Valid {
-		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token"})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid token"})
 	}
 
-	// Extract claims
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return c.Status(fiber.StatusUnauthorized).JSON(map[string]string{"error": "Invalid token claims"})
+	// Extract claims and verify email exists
+	claims := token.Claims.(jwt.MapClaims)
+	login, ok := claims["email"].(string)
+	if !ok || login == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid token: email missing"})
 	}
 
-	login := claims["email"].(string)
-
-	// Find user
+	// Get user record to derive decryption key
 	var user Users
 	if err := DB.Where("login = ?", login).First(&user).Error; err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(map[string]string{"error": "User not found"})
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
 	}
 
-	// Parse body
-	var cred getVaultInfo
-	if err := c.BodyParser(&cred); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(map[string]string{"error": "Invalid body"})
-	}
-
-	// Find the vault entry
+	// Query for vault entry. You might want to search by title or other criteria.
 	var entry vaultInfo
-	if err := DB.Where("user_email = ? AND title = ?", login, cred.Title).First(&entry).Error; err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(map[string]string{"error": "Vault entry not found"})
+	if err := DB.Where("user_email = ?", login).First(&entry).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Entry not found"})
 	}
 
-	// Decrypt secret
+	// Decrypt the secret before sending it in the response
 	salt, _ := base64.StdEncoding.DecodeString(user.EncryptionSalt)
 	key, _ := deriveKey(user.Password, salt)
 	decryptedSecret, err := decrypt(entry.Secret, key)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(map[string]string{"error": "Could not decrypt secret"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Could not decrypt secret"})
 	}
 
-	return c.JSON(fiber.Map{
-		"title":  entry.Title,
-		"secret": decryptedSecret,
-	})
-}
+	// Return a response with the decrypted secret (plain-text)
+	response := fiber.Map{
+		"ID":        entry.ID,
+		"UserEmail": entry.UserEmail,
+		"title":     entry.Title,
+		"secret":    decryptedSecret,
+	}
 
-// --- Main ---
+	return c.JSON(response)
+}
 
 func main() {
 	InitEnv()
 	Init()
 
 	app := fiber.New()
+
+	// Use CORS middleware to allow cross-origin requests
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     "http://localhost:3000",                       // Allow the frontend app to connect
+		AllowMethods:     "GET,POST,PUT,DELETE",                         // Allow these HTTP methods
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization", // Allow these headers
+		AllowCredentials: true,
+	}))
+
 	app.Use(limiter.New())
 	app.Post("/register", registerHandler)
 	app.Post("/login", loginHandler)
@@ -336,3 +369,4 @@ func main() {
 
 	log.Fatal(app.Listen(":8080"))
 }
+
